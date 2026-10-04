@@ -18,6 +18,8 @@ export interface PendingToolCall {
 export class QueryContext {
 	// Query-scoped (fully isolated per query)
 	activeQuery: unknown | null = null;
+	/** Reserve this context while native ownership is queried before child spawn. */
+	starting = false;
 	currentPiStream: AssistantMessageEventStream | null = null;
 	latestCursor = 0;
 	pendingToolCalls = new Map<string, PendingToolCall>();
