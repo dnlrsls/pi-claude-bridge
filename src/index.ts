@@ -7,6 +7,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
+import { randomUUID } from "node:crypto";
+import { ownershipEnv, ownershipRoutes } from "./engram-ownership.js";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { DEBUG_LOG_PATH, DIAG_LOG_PATH } from "./log-paths.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
@@ -579,11 +581,11 @@ async function runIsolatedSummary(
 		const cliModel = claudeCodeModelId(model, longContextSettings);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
-		sdkQuery = query({
+		sdkQuery = sideQueryImpl({
 			prompt: promptText,
 			options: {
 				cwd,
-				env: { ...process.env, ...CC_CHILD_ENV },
+				env: ownershipEnv({ ...process.env, ...CC_CHILD_ENV }),
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
@@ -855,16 +857,21 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	return { sessionId: session.sessionId };
 }
 
-// The SDK's query(), or a test double (see setQuery). The compact/summary
-// path calls the real query() directly — its subprocess must never be swapped
-// out from under a real compaction.
+// Separate test seams: replacing provider queries must not replace side queries
+// underneath compaction or delegation. Both use the real SDK in production.
 let queryImpl: typeof query = query;
+let sideQueryImpl: typeof query = query;
 
 // @internal
 export const __test = {
 	setQuery(fn: typeof query | null) {
 		queryImpl = fn ?? query;
 	},
+	setSideQuery(fn: typeof query | null) {
+		sideQueryImpl = fn ?? query;
+	},
+	promptAndWait,
+	isolatedStreamFn,
 	resetSharedSession(piSessionId?: string | null) {
 		// No id: full reset (the pre-map semantics — tests start from a blank slate).
 		if (piSessionId === undefined) sharedSessions.clear();
@@ -1728,7 +1735,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
 	debug(`provider: streamClaudeAgentSdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${ctx().activeQuery !== null}`);
 
-	let activeQuery = ctx().activeQuery !== null;
+	let activeQuery = ctx().activeQuery !== null || ctx().starting;
 	const allResults = activeQueryContexts.size > 0 ? extractAllToolResults(context) : [];
 	let resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
 
@@ -1890,6 +1897,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// armed rewrite — a sibling pi session's stays armed for its own queries.
 	if (piSessionId) historyRewrittenBySession.delete(piSessionId);
 	const { sessionId: resumeSessionId } = syncResult;
+	// Supported SDK Options.sessionId fixes a first child's identity before hooks.
+	// Resume already identifies the child; never combine the two SDK options.
+	const claudeSessionId = resumeSessionId ?? randomUUID();
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
 
@@ -1997,7 +2007,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		extraArgs,
 		...(effort ? { effort } : {}),
 		...(mcpServers ? { mcpServers } : {}),
-		...(resumeSessionId ? { resume: resumeSessionId } : {}),
+		...(resumeSessionId ? { resume: resumeSessionId } : { sessionId: claudeSessionId }),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 		...makeCliDebugOptions("provider"),
 	};
@@ -2008,7 +2018,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
-	// 3. Start SDK query and claim it for this context
+	// 3. Wait only for a NEW child. The tool-result path returned above.
+	queryCtx.starting = true;
+	let cancelledBeforeSpawn = false;
+	void (async () => {
+	const ownership = await ownershipRoutes.forQuery(piSessionId, promptText, options?.signal);
+	cancelledBeforeSpawn = ownership.cancelled || Boolean(options?.signal?.aborted);
+	if (cancelledBeforeSpawn) throw new Error("Ownership wait cancelled by abort or session reload");
+	queryOptions.env = ownershipEnv(childEnv, piSessionId, claudeSessionId, ownership);
+	queryCtx.starting = false;
 	let wasAborted = false;
 	const sdkQuery = queryImpl({ prompt: promptStream.stream, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
@@ -2146,6 +2164,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 			sdkQuery.close();
 		});
+	})().catch((error) => {
+		queryCtx.starting = false;
+		promptStream.fail(error instanceof Error ? error : new Error(String(error)));
+		if (queryCtx.promptStream === promptStream) queryCtx.promptStream = null;
+		const output = queryCtx.turnOutput!;
+		const reason = cancelledBeforeSpawn || options?.signal?.aborted ? "aborted" : "error";
+		output.stopReason = reason;
+		output.errorMessage = errorMessage(error);
+		stream.push({ type: "error", reason, error: output });
+		markStreamComplete(stream);
+		stream.end();
+		if (queryCtx.currentPiStream === stream) queryCtx.currentPiStream = null;
+	});
 
 	return stream;
 }
@@ -2239,11 +2270,11 @@ async function promptAndWait(
 	// removes the Skill tool and the listing with it — but AskClaude runs on CC's native
 	// tools, so it has to be asked for. Pi-side skills still arrive via skillsBlock below,
 	// which is meant to be the only channel.
-	const sdkQuery = query({
+	const sdkQuery = sideQueryImpl({
 		prompt,
 		options: {
 			cwd,
-			env: { ...process.env, ...CC_CHILD_ENV },
+			env: ownershipEnv({ ...process.env, ...CC_CHILD_ENV }),
 			permissionMode: "bypassPermissions",
 			settings: { ...claudeCodeSettings(providerSettings), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
 			skills: [],
@@ -2398,7 +2429,17 @@ export default function (pi: ExtensionAPI) {
 			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
 		}
 	};
+	let releaseOwnershipRoute: (() => void) | undefined;
 	pi.on("session_start", (event, ctx) => {
+		const releasePrevious = releaseOwnershipRoute;
+		releaseOwnershipRoute = undefined;
+		const runtimeSessionId = ctx.sessionManager?.getSessionId();
+		if (runtimeSessionId && pi.events) {
+			const ui = ctx.ui;
+			releaseOwnershipRoute = ownershipRoutes.bind(runtimeSessionId, pi.events, (message) => ui?.notify?.(message, "warning"));
+		}
+		// Replace first: old cleanup cannot erase the replacement's route or warning.
+		releasePrevious?.();
 		piUI = ctx.ui;
 		piMode = ctx.mode;
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
@@ -2463,6 +2504,8 @@ export default function (pi: ExtensionAPI) {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
 	pi.on("session_shutdown", () => {
+		releaseOwnershipRoute?.();
+		releaseOwnershipRoute = undefined;
 		reportLeaks("session_shutdown");
 		clearSession("session_shutdown");
 	});

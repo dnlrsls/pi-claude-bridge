@@ -140,6 +140,44 @@ To add instructions, use `message`, `context`, or a system-message edit that kee
 
 Hooks do not fire on the compact-summary side query.
 
+### Native Engram ownership
+
+Before a **new provider child**, the bridge asks the native Engram extension on
+that exact Pi session's event bus whether it owns `session-register` and
+`prompt-capture`. Decisions are independent: registration does not prove the
+current prompt was saved. The wait is bounded to 1250ms (native capture has a
+1000ms budget). Missing, mismatched or unknown decisions keep Claude hooks
+available and produce one warning per session. Enable/update native Engram and
+reload if duplicate registration or capture persists. Tool-result continuations
+reuse their child without another handshake.
+
+Cooperating Engram hooks may consume these per-child environment markers (JSON):
+
+| Marker | Fields |
+|---|---|
+| `PI_ENGRAM_BRIDGE_SESSION_REGISTER` | `version: 1`, `runtimeSessionId`, `claudeSessionId` |
+| `PI_ENGRAM_BRIDGE_PROMPT_CAPTURE` | the same identity fields plus `promptDigest` |
+
+These are **not bare readiness flags**. A registration hook must validate version
+and identity and compare `claudeSessionId` exactly with its input `session_id`.
+A prompt hook must additionally compare `promptDigest` with lowercase SHA-256 of
+its **current** UTF-8 prompt after JavaScript `String.trim()`. Never suppress on
+registration alone, a foreign child ID, or a digest from an earlier prompt in a
+long-lived child. Prompts of ten or fewer trimmed JavaScript characters never
+receive a capture marker. No raw prompt is exported.
+
+The bridge emits `engram:bridge:claim:v1` with `runtimeSessionId` (unchanged), a
+fresh `nonce`, `operation`, and, for capture only, `promptDigest`. It accepts
+`engram:bridge:decision:v1` only with identical correlation fields and digest and
+`status: "owned" | "unknown"`. These markers require cooperating hook consumers;
+the bridge does not remove or rewrite hooks or change `PreToolUse`. Do not apply
+the broad `PI_CODING_AGENT` skip above to Engram ownership.
+
+First children receive an explicit SDK `sessionId` UUID before hooks run;
+resumed children use only SDK `resume`. Unknown/provider-unattributed queries,
+AskClaude delegated conversations, and summaries clear inherited ownership
+markers. AskClaude keeps its Claude hooks; summaries keep `settingSources: []`.
+
 ### System prompt rejections
 
 Other extensions can change the system prompt. When the result still contains pi's built-in system prompt text, or the two documentation paths that Anthropic looks for (`docs/custom-provider.md` in the same prompt with `docs/packages.md`), the bridge stops the turn instead of sending it, since Anthropic may otherwise bill these requests as Extra Usage. Fix the source extension before retrying; `CLAUDE_BRIDGE_DEBUG=1` writes the full prompt to the bridge log when this happens.
